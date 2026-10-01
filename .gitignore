@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+auslan_data/samples/
+auslan_data/sequences/
+auslan_data/*.joblib
+auslan_data/*.keras
+auslan_data/*.h5
+*.mp4
+.DS_Store
+.idea/
+.vscode/

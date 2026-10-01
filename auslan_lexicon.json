@@ -1,0 +1,4 @@
+{
+  "words": ["HELLO", "YES", "NO", "THANKS", "PLEASE", "GOOD", "BYE"],
+  "notes": "Whole-sign labels and fingerspelled words that auto-commit when the letter buffer matches."
+}
