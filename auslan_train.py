@@ -90,9 +90,59 @@ def train_random_forest(samples_dir, out_path):
     )
     clf.fit(x, y)
     labels = sorted(set(ys))
+    from sklearn.cluster import KMeans
+
+    centroids = {}
+    own_dist = []
+    proto_list = []
+    proto_labels = []
+    for label in labels:
+        block = x[y == label]
+        k = 1 if len(block) < 25 else max(1, len(block) // 25)
+        if k == 1:
+            centers = [block.mean(axis=0).astype(np.float32)]
+        else:
+            km = KMeans(n_clusters=k, n_init=10, random_state=42)
+            km.fit(block)
+            centers = [c.astype(np.float32) for c in km.cluster_centers_]
+        centroids[label] = np.stack(centers).astype(np.float32)
+        for center in centers:
+            proto_list.append(center)
+            proto_labels.append(label)
+        for row in block:
+            own_dist.append(min(float(np.linalg.norm(row - c)) for c in centers))
+    gap = None
+    for i in range(len(proto_list)):
+        for j in range(i + 1, len(proto_list)):
+            if proto_labels[i] == proto_labels[j]:
+                continue
+            dist = float(np.linalg.norm(proto_list[i] - proto_list[j]))
+            gap = dist if gap is None else min(gap, dist)
+    # Radius of the jitter around each Signbank view, not the gap between views.
+    max_dist = float(np.percentile(own_dist, 95)) * 1.15 if own_dist else 0.0
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    joblib.dump({"model": clf, "labels": labels, "backend": "sklearn_rf"}, out_path)
-    _save_labels(LABELS_JSON, labels, {"backend": "sklearn_rf", "n_samples": len(xs)})
+    joblib.dump(
+        {
+            "model": clf,
+            "labels": labels,
+            "backend": "sklearn_rf",
+            "centroids": centroids,
+            "max_dist": max_dist,
+            "centroid_gap": gap,
+        },
+        out_path,
+    )
+    _save_labels(
+        LABELS_JSON,
+        labels,
+        {
+            "backend": "sklearn_rf",
+            "n_samples": len(xs),
+            "max_dist": max_dist,
+            "centroid_gap": gap,
+        },
+    )
+    print(f"centroid gap={gap:.3f} max_dist={max_dist:.3f}" if gap is not None else "no centroid gap")
     return len(xs), labels, out_path
 
 

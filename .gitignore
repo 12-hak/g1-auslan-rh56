@@ -2,7 +2,9 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+auslan_data/signbank/
 auslan_data/samples/
+auslan_data/live_samples/
 auslan_data/sequences/
 auslan_data/*.joblib
 auslan_data/*.keras

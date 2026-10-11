@@ -24,8 +24,8 @@ def ensure_dirs():
     os.makedirs(SEQ_DIR, exist_ok=True)
 
 
-def save_static(label, feat):
-    folder = os.path.join(SAMPLES_DIR, label.upper())
+def save_static(label, feat, root=None):
+    folder = os.path.join(root or SAMPLES_DIR, label.upper())
     os.makedirs(folder, exist_ok=True)
     name = f"{int(time.time() * 1000)}_{np.random.randint(0, 9999):04d}.npy"
     path = os.path.join(folder, name)
@@ -216,6 +216,213 @@ def collect_loop(camera, frames_per_key, seq_mode, seq_len):
     return 0
 
 
+LIVE_DIR = os.path.join(HERE, "auslan_data", "live_samples")
+LETTERS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+# Auslan C is formed with one hand. The other letters in this set use both.
+ONE_HAND_LETTERS = {"C"}
+# These letters were one frozen pose, so a small change flipped them.
+# I / O / U are a point on middle, ring, and little finger. J and H move.
+CUES = {
+    "I": "Point at the middle finger. Hold still.",
+    "J": "Hold the end of J, after the hook. Not the start.",
+    "T": "Hold the finished T. Both hands still.",
+    "S": "Hold the finished S. Both hands still.",
+    "F": "Hold the finished F. Both hands still.",
+    "O": "Point at the ring finger. Hold still.",
+    "H": "Hold the finished H, not the middle of the movement.",
+    "U": "Point at the little finger. Hold still.",
+}
+
+
+def hands_needed(letter):
+    return 1 if str(letter).upper() in ONE_HAND_LETTERS else 2
+
+
+def _replace_letter_samples(letter):
+    folder = os.path.join(LIVE_DIR, letter.upper())
+    if not os.path.isdir(folder):
+        return
+    for name in os.listdir(folder):
+        if name.endswith(".npy"):
+            os.remove(os.path.join(folder, name))
+
+
+def guided_collect(camera, realsense, frames=15, letters=None):
+    """Prompt each letter. Space starts a 3s countdown, then records it."""
+    from auslan_app import draw_hands, open_capture, poll_keys
+
+    if not os.path.isfile(MODEL_PATH):
+        print(f"Missing {MODEL_PATH}")
+        return 1
+    os.makedirs(LIVE_DIR, exist_ok=True)
+
+    class _Args:
+        pass
+
+    args = _Args()
+    args.camera = camera
+    args.realsense = realsense
+    cap = open_capture(args)
+    if cap is None:
+        return 1
+
+    base = python.BaseOptions(model_asset_path=MODEL_PATH)
+    opts = vision.HandLandmarkerOptions(base_options=base, num_hands=2)
+    detector = vision.HandLandmarker.create_from_options(opts)
+
+    queue = [ch.upper() for ch in (letters or LETTERS)]
+    index = 0
+    phase = "ready"
+    started = 0.0
+    grabbed = []
+    saved_any = False
+    replaced = set()
+    notice = "Press space when you are holding the letter"
+    print("Guided capture. Click the window. Space = 3s countdown, then record. q = quit, b = back.")
+
+    try:
+        while index < len(queue):
+            ok, bgr = cap.read()
+            if not ok or bgr is None:
+                print("Camera frame stopped")
+                return 1
+            bgr = cv2.flip(bgr, 1)
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            result = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
+            draw_hands(bgr, result)
+            letter = queue[index]
+            need = hands_needed(letter)
+            n_hands = len(result.hand_landmarks) if result.hand_landmarks else 0
+            feat = None
+            if n_hands:
+                feat = extract_features(result.hand_landmarks, result.handedness)
+
+            now = time.time()
+            if phase == "countdown":
+                left = 3.0 - (now - started)
+                if left <= 0:
+                    phase = "record"
+                    grabbed = []
+                    started = now
+                else:
+                    cv2.putText(
+                        bgr,
+                        str(max(1, int(np.ceil(left)))),
+                        (bgr.shape[1] // 2 - 30, bgr.shape[0] // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        4.0,
+                        (0, 220, 255),
+                        6,
+                    )
+            elif phase == "record":
+                hand_ok = n_hands == 1 if need == 1 else n_hands >= 2
+                if feat is not None and hand_ok:
+                    grabbed.append(feat)
+                cv2.putText(
+                    bgr,
+                    f"Recording {letter}  {len(grabbed)}/{frames}",
+                    (10, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 255, 0),
+                    2,
+                )
+                if len(grabbed) >= frames:
+                    if letter not in replaced:
+                        _replace_letter_samples(letter)
+                        replaced.add(letter)
+                    for sample in grabbed:
+                        save_static(letter, sample, root=LIVE_DIR)
+                    print(f"Saved {len(grabbed)} one-hand frames for {letter}" if need == 1 else f"Saved {len(grabbed)} frames for {letter}")
+                    print(f"  -> {LIVE_DIR}")
+                    saved_any = True
+                    phase = "ready"
+                    notice = f"Saved {letter}. Space adds another take. N goes to the next letter."
+                    grabbed = []
+                elif now - started > 2.5:
+                    phase = "ready"
+                    notice = (
+                        "Use one hand only. Press space to try again."
+                        if need == 1
+                        else "Need both hands in frame. Press space to try again."
+                    )
+                    grabbed = []
+
+            if index >= len(queue):
+                break
+
+            letter = queue[index]
+            need = hands_needed(letter)
+            cv2.putText(
+                bgr,
+                f"Sign {letter} ({'one hand' if need == 1 else 'both hands'})   {index + 1}/{len(queue)}",
+                (10, 50),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.2,
+                (0, 255, 255),
+                3,
+            )
+            cue = CUES.get(letter, "")
+            if cue:
+                cv2.putText(
+                    bgr,
+                    cue,
+                    (10, 88),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (180, 255, 180),
+                    2,
+                )
+            cv2.putText(
+                bgr,
+                f"hands={n_hands}  {notice}",
+                (10, 122),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (220, 220, 220),
+                2,
+            )
+            cv2.putText(
+                bgr,
+                "space = 3s then capture | n next | b back | q quit",
+                (10, bgr.shape[0] - 12),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (180, 180, 180),
+                1,
+            )
+            cv2.imshow("Auslan collect", bgr)
+            keys = poll_keys()
+            if "q" in keys:
+                break
+            if "b" in keys and phase == "ready" and index > 0:
+                index -= 1
+                notice = f"Back to {queue[index]}. Press space when ready."
+            if "n" in keys and phase == "ready" and index < len(queue) - 1:
+                index += 1
+                notice = f"Next is {queue[index]}. Press space when ready."
+            if " " in keys and phase == "ready":
+                phase = "countdown"
+                started = time.time()
+                notice = "Hold the letter"
+        else:
+            print(f"Finished A–Z in {LIVE_DIR}")
+    finally:
+        cap.release()
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error:
+            pass
+    print(f"Live samples are in {LIVE_DIR}")
+    if saved_any:
+        from auslan_train import RF_JOBLIB, train_random_forest
+
+        count, labels, path = train_random_forest(LIVE_DIR, RF_JOBLIB)
+        print(f"Retrained on {count} live frames -> {path}")
+        print(f"Labels: {labels}")
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(description="Collect Auslan samples (static or sequences) / train")
     p.add_argument("--camera", type=int, default=0)
@@ -229,6 +436,13 @@ def main():
         help="train TensorFlow static+seq (if data exists) and exit",
     )
     p.add_argument("--label", default=None, help="optional: print path hint for a new label folder")
+    p.add_argument("--realsense", action="store_true", help="capture from the Intel RealSense color camera")
+    p.add_argument("--letters", default="", help="only these letters, e.g. C")
+    p.add_argument(
+        "--guided",
+        action="store_true",
+        help="prompt each letter; space waits 3s, then records",
+    )
     args = p.parse_args()
 
     ensure_dirs()
@@ -247,6 +461,15 @@ def main():
     if args.train_tf:
         rc = os.system(f'"{sys.executable}" "{os.path.join(HERE, "auslan_train.py")}" --backend all')
         return 0 if rc == 0 else 1
+
+    if args.guided or args.realsense:
+        chosen = [ch.upper() for ch in args.letters if ch.isalpha()]
+        return guided_collect(
+            args.camera,
+            args.realsense,
+            frames=min(args.frames, 20),
+            letters=chosen or None,
+        )
 
     return collect_loop(args.camera, args.frames, args.seq, args.seq_len)
 

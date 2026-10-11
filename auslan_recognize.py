@@ -10,7 +10,7 @@ try:
 except ImportError:
     joblib = None
 
-from auslan_features import FEATURE_DIM, finger_curl_ratios
+from auslan_features import FEATURE_DIM, finger_curl_ratios, finger_split, index_contact, pointed_vowel
 
 WORD_LABELS = {"HELLO", "YES", "NO", "THANKS", "PLEASE", "GOOD", "BYE"}
 LETTER_LABELS = {chr(c) for c in range(ord("A"), ord("Z") + 1)}
@@ -96,6 +96,51 @@ class FeatureRing:
         return arr
 
 
+def _centers_of(value):
+    arr = np.asarray(value, dtype=np.float32)
+    if arr.ndim == 1:
+        return [arr]
+    return [row for row in arr]
+
+
+def _signbank_match(feat, centroids, max_dist, hand_landmarks_list=None):
+    ranked = []
+    for label, value in centroids.items():
+        dist = min(float(np.linalg.norm(feat - center)) for center in _centers_of(value))
+        ranked.append((dist, str(label).upper()))
+    ranked.sort()
+    if not ranked:
+        return None, 0.0
+    contact = index_contact(hand_landmarks_list) if hand_landmarks_list else None
+    # Contact letters are decided from the hands themselves. A nearby centroid
+    # was blanking them once the fingers touched.
+    if contact == "R":
+        return "R", 0.92
+    if contact == "T":
+        return "T", 0.92
+    # V was the nearest shape to N whenever the fingers were not split far
+    # enough in the full-hand match. The gap between index and middle is V.
+    if finger_split(hand_landmarks_list) == "V":
+        return "V", 0.92
+    dist, label = ranked[0]
+    if dist > max_dist:
+        return None, 0.0
+    second_dist = ranked[1][0] if len(ranked) > 1 else dist + 1.0
+    margin = (second_dist - dist) / (second_dist + 1e-6)
+    conf = float(min(0.99, 0.5 + margin))
+    pointed = pointed_vowel(hand_landmarks_list) if hand_landmarks_list else None
+    # U is a point on the little finger, even if the whole-hand match says T or I.
+    if contact == "U" or (pointed and pointed[0] == "U"):
+        return "U", max(conf, 0.9)
+    if contact == "I" or (pointed and pointed[0] == "I" and label != "T"):
+        return "I", max(conf, 0.9)
+    if label in {"T", "R", "V"}:
+        return label, max(conf, 0.75)
+    if margin < 0.22:
+        return None, 0.0
+    return label, conf
+
+
 class SignClassifier:
     """
     Backends (auto-picked if model_path is a directory / default):
@@ -109,6 +154,8 @@ class SignClassifier:
         self.backend = None
         self.model = None
         self.labels = []
+        self.centroids = {}
+        self.max_dist = 0.0
         self.seq_len = seq_len
         self.ring = FeatureRing(seq_len=seq_len)
         self.load(model_path, labels_path)
@@ -117,6 +164,8 @@ class SignClassifier:
         self.backend = None
         self.model = None
         self.labels = []
+        self.centroids = {}
+        self.max_dist = 0.0
         labels_path = labels_path or DEFAULT_LABELS
 
         candidates = []
@@ -144,8 +193,10 @@ class SignClassifier:
             payload = joblib.load(path)
             self.model = payload["model"]
             self.labels = [str(x).upper() for x in payload.get("labels", [])]
-            self.backend = "sklearn_rf"
-            print(f"Loaded RF ({len(self.labels)} labels): {path}")
+            self.backend = payload.get("backend", "sklearn_rf")
+            self.centroids = payload.get("centroids") or {}
+            self.max_dist = float(payload.get("max_dist", 0.0) or 0.0)
+            print(f"Loaded {self.backend} ({len(self.labels)} labels): {path}")
             return True
         except Exception as e:
             print(f"RF load failed: {e}")
@@ -203,6 +254,10 @@ class SignClassifier:
 
         if self.backend == "sklearn_rf" and self.model is not None:
             x = feat.reshape(1, -1)
+            if self.centroids and self.max_dist > 0:
+                return _signbank_match(
+                    x[0], self.centroids, self.max_dist, hand_landmarks_list
+                )
             if hasattr(self.model, "predict_proba"):
                 proba = self.model.predict_proba(x)[0]
                 idx = int(np.argmax(proba))
