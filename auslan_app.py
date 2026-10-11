@@ -498,30 +498,55 @@ class RealSenseColor:
     def __init__(self):
         import pyrealsense2 as rs
 
-        self._pipe = rs.pipeline()
-        cfg = rs.config()
-        cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+        self._rs = rs
+        self._pipe = None
+        try:
+            self._start()
+            self._pipe.wait_for_frames(3000)
+        except RuntimeError as e:
+            print(f"RealSense did not deliver a frame ({e}); resetting the camera.")
+            self._stop()
+            self._reset_device()
+            time.sleep(4)
+            self._start()
+
+    def _start(self):
+        self._stop()
+        self._pipe = self._rs.pipeline()
+        cfg = self._rs.config()
+        cfg.enable_stream(self._rs.stream.color, 640, 480, self._rs.format.bgr8, 30)
         self._pipe.start(cfg)
 
-    def isOpened(self):
-        return True
-
-    def read(self):
-        try:
-            frames = self._pipe.wait_for_frames(2000)
-        except RuntimeError as e:
-            print(f"RealSense frame timeout: {e}")
-            return False, None
-        color = frames.get_color_frame()
-        if not color:
-            return False, None
-        return True, np.asanyarray(color.get_data())
-
-    def release(self):
+    def _stop(self):
+        if self._pipe is None:
+            return
         try:
             self._pipe.stop()
         except RuntimeError:
             pass
+        self._pipe = None
+
+    def _reset_device(self):
+        for dev in self._rs.context().query_devices():
+            dev.hardware_reset()
+
+    def isOpened(self):
+        return self._pipe is not None
+
+    def read(self):
+        for _ in range(5):
+            try:
+                frames = self._pipe.wait_for_frames(2000)
+            except RuntimeError as e:
+                print(f"RealSense frame timeout: {e}")
+                continue
+            color = frames.get_color_frame()
+            if color:
+                return True, np.asanyarray(color.get_data())
+        return False, None
+
+    def release(self):
+        self._stop()
 
 
 def open_capture(args):
